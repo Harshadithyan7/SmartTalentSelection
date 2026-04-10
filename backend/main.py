@@ -1,10 +1,11 @@
 """
-Smart Talent Selection — Resume Summariser API
-Accepts PDF, DOCX, or image files and returns a structured resume summary
-powered by Google Gemini AI.
+Smart Talent Selection — HR Resume Comparison API
+Accepts multiple PDF, DOCX, or image resumes and returns a structured
+comparison table powered by Google Gemini AI.
 """
 
 import io
+import json
 import os
 import tempfile
 from pathlib import Path
@@ -20,8 +21,8 @@ from PIL import Image
 # ---------------------------------------------------------------------------
 app = FastAPI(
     title="Smart Talent Selection",
-    description="Upload a resume (PDF / DOCX / Image) and get an AI‑generated summary.",
-    version="1.0.0",
+    description="Upload multiple resumes and get an AI‑powered comparison table.",
+    version="2.0.0",
 )
 
 app.add_middleware(
@@ -53,16 +54,19 @@ def _get_client() -> genai.Client:
             )
         _client = genai.Client(api_key=api_key)
     return _client
-MODEL = "gemini-3-flash-preview"
+
+MODEL = "gemini-2.5-flash-preview-04-17"
 
 # ---------------------------------------------------------------------------
 # Allowed file types
 # ---------------------------------------------------------------------------
-ALLOWED_EXTENSIONS = {".pdf", ".docx", ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff"}
+ALLOWED_EXTENSIONS = {".pdf", ".doc", ".docx", ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff"}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff"}
+MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB per file
+MAX_FILES = 20  # Maximum number of files per comparison
 
 # ---------------------------------------------------------------------------
-# Prompt
+# Prompts
 # ---------------------------------------------------------------------------
 RESUME_SUMMARY_PROMPT = """You are an expert HR assistant. Analyse the following resume and 
 return a **structured summary** in the format below. If a section is missing from the 
@@ -99,6 +103,44 @@ resume, write "Not mentioned".
 
 ### Overall Assessment
 (Brief assessment of the candidate's profile — strengths, potential fit areas, and gaps)
+"""
+
+RESUME_JSON_PROMPT = """You are an expert HR assistant. Analyse the following resume and 
+return a **structured JSON object** (no markdown, no code fences, just pure JSON) with 
+exactly this schema:
+
+{
+  "name": "Full Name",
+  "email": "email@example.com",
+  "phone": "+1234567890",
+  "location": "City, Country",
+  "professional_summary": "2-3 sentence overview",
+  "skills": ["skill1", "skill2", "skill3"],
+  "experience": [
+    {
+      "company": "Company Name",
+      "role": "Job Title",
+      "duration": "Start - End",
+      "highlights": "Key achievements"
+    }
+  ],
+  "total_experience_years": 5,
+  "education": [
+    {
+      "institution": "University Name",
+      "degree": "Degree Name",
+      "year": "2020"
+    }
+  ],
+  "certifications": ["cert1", "cert2"],
+  "projects": ["project1", "project2"],
+  "strengths": ["strength1", "strength2"],
+  "gaps": ["gap1", "gap2"]
+}
+
+If a field is missing from the resume, use null for strings/numbers or an empty 
+array [] for lists. For total_experience_years, estimate from the experience entries 
+if not stated explicitly. Return ONLY valid JSON, nothing else.
 """
 
 
@@ -143,14 +185,35 @@ def _extract_content_from_pdf(file_bytes: bytes) -> tuple[str | None, list[bytes
     return (full_text.strip() or None, images)
 
 
+def extract_text_and_images(file_bytes: bytes, ext: str):
+    """Extract text and/or images from a resume file."""
+    text = None
+    images = []
+
+    if ext == ".docx":
+        text = _extract_text_from_docx(file_bytes)
+    elif ext == ".pdf":
+        text, images = _extract_content_from_pdf(file_bytes)
+    elif ext in IMAGE_EXTENSIONS:
+        try:
+            img = Image.open(io.BytesIO(file_bytes))
+            img.verify()
+            images = [file_bytes]
+        except Exception:
+            raise HTTPException(status_code=422, detail="Uploaded file is not a valid image.")
+
+    return text, images
+
+
 # ---------------------------------------------------------------------------
 # Core: call Gemini
 # ---------------------------------------------------------------------------
 async def _summarise_with_gemini(
     text: str | None = None,
     image_bytes_list: list[bytes] | None = None,
+    prompt: str = RESUME_SUMMARY_PROMPT,
 ) -> str:
-    """Send content to Gemini and return the summary."""
+    """Send content to Gemini and return the response text."""
 
     parts: list[types.Part] = []
 
@@ -166,7 +229,7 @@ async def _summarise_with_gemini(
             )
 
     # Always append the instruction prompt last
-    parts.append(types.Part.from_text(text=RESUME_SUMMARY_PROMPT))
+    parts.append(types.Part.from_text(text=prompt))
 
     response = _get_client().models.generate_content(
         model=MODEL,
@@ -176,8 +239,22 @@ async def _summarise_with_gemini(
     return response.text
 
 
+def _parse_json_response(raw: str) -> dict:
+    """Attempt to parse a JSON response from Gemini, stripping markdown fences if present."""
+    text = raw.strip()
+    # Remove markdown code fences
+    if text.startswith("```"):
+        lines = text.split("\n")
+        # Remove first line (```json or ```) and last line (```)
+        lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines)
+    return json.loads(text)
+
+
 # ---------------------------------------------------------------------------
-# Endpoint
+# Endpoint: Single resume summary (backward compatible)
 # ---------------------------------------------------------------------------
 @app.post("/summarise")
 async def summarise_resume(file: UploadFile = File(...)):
@@ -197,56 +274,171 @@ async def summarise_resume(file: UploadFile = File(...)):
     file_bytes = await file.read()
     if not file_bytes:
         raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+    if len(file_bytes) > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large (max {MAX_FILE_SIZE // (1024*1024)}MB)."
+        )
 
-    text: str | None = None
-    images: list[bytes] = []
+    return await process_upload(file.filename, file_bytes, ext)
 
+
+@app.post("/upload")
+async def upload_resume(file: UploadFile = File(...)):
+    """Handle file upload separately; returns the summary and storage info."""
+
+    ext = Path(file.filename or "").suffix.lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unsupported file type '{ext}'. "
+                f"Allowed: {', '.join(sorted(ALLOWED_EXTENSIONS))}"
+            ),
+        )
+
+    file_bytes = await file.read()
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+    if len(file_bytes) > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large (max {MAX_FILE_SIZE // (1024*1024)}MB)."
+        )
+
+    saved_path = None
     try:
-        if ext == ".docx":
-            text = _extract_text_from_docx(file_bytes)
-            if not text:
-                raise HTTPException(
-                    status_code=422,
-                    detail="Could not extract any text from the DOCX file.",
-                )
+        with tempfile.NamedTemporaryFile(delete=False, suffix=ext, prefix="resume-") as tmp:
+            tmp.write(file_bytes)
+            saved_path = tmp.name
 
-        elif ext == ".pdf":
-            text, images = _extract_content_from_pdf(file_bytes)
-            if not text and not images:
-                raise HTTPException(
-                    status_code=422,
-                    detail="Could not extract text or images from the PDF.",
-                )
+        summary = await _summarise_with_gemini(*extract_text_and_images(file_bytes, ext))
 
-        elif ext in IMAGE_EXTENSIONS:
-            # Validate it's a real image, then pass raw bytes
+        return {
+            "filename": file.filename,
+            "path": saved_path,
+            "summary": summary,
+            "message": "Upload successful",
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Upload/process error: {exc}")
+
+
+async def process_upload(filename: str, file_bytes: bytes, ext: str):
+    text, images = extract_text_and_images(file_bytes, ext)
+
+    if ext == ".docx" and not text:
+        raise HTTPException(status_code=422, detail="Could not extract any text from the DOCX file.")
+
+    if ext == ".pdf" and not text and not images:
+        raise HTTPException(status_code=422, detail="Could not extract text or images from the PDF.")
+
+    if ext in IMAGE_EXTENSIONS and not images:
+        raise HTTPException(status_code=422, detail="Could not process the image file.")
+
+    summary = await _summarise_with_gemini(text=text, image_bytes_list=images or None)
+    return {
+        "filename": filename,
+        "summary": summary,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Endpoint: Multi‑resume comparison
+# ---------------------------------------------------------------------------
+@app.post("/compare")
+async def compare_resumes(files: list[UploadFile] = File(...)):
+    """Upload multiple resume files and receive a structured comparison."""
+
+    if len(files) < 2:
+        raise HTTPException(
+            status_code=400,
+            detail="Please upload at least 2 resumes for comparison.",
+        )
+    if len(files) > MAX_FILES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Too many files. Maximum {MAX_FILES} resumes per comparison.",
+        )
+
+    candidates = []
+    errors = []
+
+    for idx, file in enumerate(files):
+        ext = Path(file.filename or "").suffix.lower()
+        if ext not in ALLOWED_EXTENSIONS:
+            errors.append({
+                "filename": file.filename,
+                "error": f"Unsupported file type '{ext}'",
+            })
+            continue
+
+        file_bytes = await file.read()
+        if not file_bytes:
+            errors.append({"filename": file.filename, "error": "File is empty"})
+            continue
+        if len(file_bytes) > MAX_FILE_SIZE:
+            errors.append({
+                "filename": file.filename,
+                "error": f"File too large (max {MAX_FILE_SIZE // (1024*1024)}MB)",
+            })
+            continue
+
+        try:
+            text, images = extract_text_and_images(file_bytes, ext)
+
+            # Request structured JSON from Gemini
+            raw_response = await _summarise_with_gemini(
+                text=text,
+                image_bytes_list=images or None,
+                prompt=RESUME_JSON_PROMPT,
+            )
+
+            candidate_data = _parse_json_response(raw_response)
+            candidate_data["_filename"] = file.filename
+            candidate_data["_index"] = idx
+            candidates.append(candidate_data)
+
+        except json.JSONDecodeError:
+            # Retry once if JSON parsing fails
             try:
-                img = Image.open(io.BytesIO(file_bytes))
-                img.verify()
-            except Exception:
-                raise HTTPException(
-                    status_code=422, detail="Uploaded file is not a valid image."
+                raw_response = await _summarise_with_gemini(
+                    text=text,
+                    image_bytes_list=images or None,
+                    prompt=RESUME_JSON_PROMPT + "\n\nIMPORTANT: Return ONLY valid JSON. No markdown formatting.",
                 )
-            images = [file_bytes]
+                candidate_data = _parse_json_response(raw_response)
+                candidate_data["_filename"] = file.filename
+                candidate_data["_index"] = idx
+                candidates.append(candidate_data)
+            except Exception as e:
+                errors.append({
+                    "filename": file.filename,
+                    "error": f"Failed to parse AI response: {str(e)}",
+                })
+        except Exception as e:
+            errors.append({
+                "filename": file.filename,
+                "error": str(e),
+            })
 
-    except HTTPException:
-        raise
-    except Exception as exc:
+    if not candidates:
         raise HTTPException(
-            status_code=500, detail=f"Error processing the file: {exc}"
+            status_code=422,
+            detail="Could not process any of the uploaded resumes.",
         )
 
-    # Call Gemini
-    try:
-        summary = await _summarise_with_gemini(text=text, image_bytes_list=images or None)
-    except Exception as exc:
-        raise HTTPException(
-            status_code=502, detail=f"Gemini API error: {exc}"
-        )
+    # Build comparison data
+    all_skills = set()
+    for c in candidates:
+        for s in (c.get("skills") or []):
+            all_skills.add(s.strip().lower())
 
     return {
-        "filename": file.filename,
-        "summary": summary,
+        "candidates": candidates,
+        "total_processed": len(candidates),
+        "errors": errors,
+        "all_skills": sorted(all_skills),
     }
 
 
@@ -255,7 +447,7 @@ async def summarise_resume(file: UploadFile = File(...)):
 # ---------------------------------------------------------------------------
 @app.get("/")
 async def root():
-    return {"status": "ok", "message": "Smart Talent Selection API is running."}
+    return {"status": "ok", "message": "Smart Talent Selection API v2.0 is running."}
 
 
 # ---------------------------------------------------------------------------
