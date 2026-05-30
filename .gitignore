@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Databases and local storage
+*.db
+database/*.db
+storage/resumes/*
+!storage/resumes/.gitkeep
+
+# IDE/OS
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
